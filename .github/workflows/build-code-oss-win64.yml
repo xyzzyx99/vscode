@@ -61,6 +61,30 @@ jobs:
           $source = $source.Replace($old, $new)
           [System.IO.File]::WriteAllText((Resolve-Path $file), $source, [System.Text.UTF8Encoding]::new($false))
 
+      # VS Code uses signtool to verify/remove existing Authenticode signatures
+      # before rewriting version resources, even for unsigned Code - OSS builds.
+      - name: Locate Windows SDK SignTool
+        shell: pwsh
+        run: |
+          $sdkRoots = @(
+            "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
+            "${env:ProgramFiles}\Windows Kits\10\bin"
+          )
+          $tools = foreach ($root in $sdkRoots) {
+            if (Test-Path $root) {
+              Get-ChildItem -Path $root -Filter signtool.exe -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.DirectoryName -match '[\\/]x64$' }
+            }
+          }
+          $tool = $tools | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $tool) {
+            throw 'signtool.exe not found. Install the Windows 10/11 SDK Signing Tools on this runner.'
+          }
+          $toolDir = $tool.DirectoryName
+          Write-Host "Using SignTool: $($tool.FullName)"
+          $toolDir >> $env:GITHUB_PATH
+          & $tool.FullName /?
+
       - name: Build and package Code OSS
         shell: pwsh
         run: npm run gulp -- vscode-win32-x64-min
