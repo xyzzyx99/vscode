@@ -38,6 +38,29 @@ jobs:
         shell: pwsh
         run: npm install
 
+      # The OSS package may omit the built-in Copilot extension. Upstream's
+      # packaging currently assumes its SDK exists and otherwise fails.
+      - name: Allow missing Copilot SDK in OSS packaging
+        shell: pwsh
+        run: |
+          $file = 'build/gulpfile.vscode.ts'
+          $source = [System.IO.File]::ReadAllText((Resolve-Path $file))
+          $old = 'prepareBuiltInCopilotRipgrepShim(platform, arch, builtInCopilotExtensionDir, appNodeModulesDir);'
+          if (-not $source.Contains($old)) {
+            throw "Expected Copilot shim call not found in $file; upstream may have changed."
+          }
+          $new = @'
+          if (fs.existsSync(path.join(builtInCopilotExtensionDir, 'node_modules', '@github', 'copilot', 'sdk'))) {
+              prepareBuiltInCopilotRipgrepShim(platform, arch, builtInCopilotExtensionDir, appNodeModulesDir);
+          } else if (process.env['VSCODE_QUALITY'] === 'oss') {
+              console.log('[Code OSS] Copilot SDK absent; skipping built-in Copilot ripgrep shim.');
+          } else {
+              throw new Error('Built-in Copilot SDK missing from non-OSS build');
+          }
+          '@
+          $source = $source.Replace($old, $new)
+          [System.IO.File]::WriteAllText((Resolve-Path $file), $source, [System.Text.UTF8Encoding]::new($false))
+
       - name: Build and package Code OSS
         shell: pwsh
         run: npm run gulp -- vscode-win32-x64-min
