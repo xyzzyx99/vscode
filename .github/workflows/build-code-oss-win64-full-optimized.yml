@@ -1,0 +1,204 @@
+name: Build Code OSS Windows x64 AVX2 and selective LTO
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 optimized packaged application
+    runs-on: windows-2025
+    timeout-minutes: 360
+    env:
+      VSCODE_QUALITY: oss
+      npm_config_arch: x64
+      GYP_MSVS_VERSION: '2022'
+
+      # Proven native compiler optimizations. Never inject /GL or /LTCG
+      # globally: doing so broke node-gyp and the Rust CLI in earlier tests.
+      CL: '/O2 /arch:AVX2'
+
+      # Rust release optimizations (apply if this source/build invokes Cargo).
+      RUSTFLAGS: '-C target-feature=+avx2'
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: '3'
+      CARGO_PROFILE_RELEASE_LTO: 'fat'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '1'
+
+    steps:
+      - name: Check out Code OSS sources
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js from .nvmrc
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Set up Python for node-gyp
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python setuptools
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade setuptools
+          if ($LASTEXITCODE -ne 0) { throw 'setuptools installation failed' }
+
+      - name: Display optimization configuration
+        shell: pwsh
+        run: |
+          Write-Host "MSVC compiler flags: $env:CL"
+          Write-Host 'Global MSVC /GL and /LTCG: disabled'
+          Write-Host 'Selected @vscode/deviceid native addon: /GL + /LTCG'
+          Write-Host "Rust flags: $env:RUSTFLAGS"
+          Write-Host "Rust release opt-level: $env:CARGO_PROFILE_RELEASE_OPT_LEVEL"
+          Write-Host "Rust release LTO: $env:CARGO_PROFILE_RELEASE_LTO"
+          Write-Host "Rust codegen units: $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
+          Write-Host 'Prebuilt Electron and other precompiled components are not recompiled.'
+          node --version
+          npm --version
+          python --version
+          if (Get-Command cargo -ErrorAction SilentlyContinue) { cargo --version }
+
+      # Install dependencies with the previously successful compiler flags;
+      # do not interfere with third-party native linker invocations.
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          Remove-Item Env:LINK -ErrorAction SilentlyContinue
+          Remove-Item Env:_LINK_ -ErrorAction SilentlyContinue
+          Remove-Item Env:_CL_ -ErrorAction SilentlyContinue
+          npm install
+          if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
+
+      # Target-specific /GL + /LTCG: patch exactly one installed native addon.
+      # This avoids forcing these options on all node-gyp dependencies or Rust.
+      - name: Enable whole-program and link-time optimization for deviceid
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $file = Join-Path $env:GITHUB_WORKSPACE 'node_modules/@vscode/deviceid/binding.gyp'
+          if (-not (Test-Path $file -PathType Leaf)) { throw "Cannot locate target: $file" }
+          $source = [System.IO.File]::ReadAllText($file)
+
+          $compilerPattern = '"VCCLCompilerTool"\s*:\s*\{'
+          $linkerPattern = '"VCLinkerTool"\s*:\s*\{'
+          if (-not [regex]::IsMatch($source, $compilerPattern)) {
+            throw 'VCCLCompilerTool block not found; addon configuration may have changed.'
+          }
+          if (-not [regex]::IsMatch($source, $linkerPattern)) {
+            throw 'VCLinkerTool block not found; addon configuration may have changed.'
+          }
+          if ($source -match '"WholeProgramOptimization"|"LinkTimeCodeGeneration"') {
+            throw 'Target already has optimization settings; inspect before modifying.'
+          }
+
+          $source = ([regex]::new($compilerPattern)).Replace(
+            $source, '"VCCLCompilerTool": { "WholeProgramOptimization": "true", ', 1)
+          $source = ([regex]::new($linkerPattern)).Replace(
+            $source, '"VCLinkerTool": { "LinkTimeCodeGeneration": "UseLinkTimeCodeGeneration", "LinkIncremental": 1, ', 1)
+          [System.IO.File]::WriteAllText($file, $source, [System.Text.UTF8Encoding]::new($false))
+          Write-Host "Enabled /GL + /LTCG for: $file"
+          Select-String -Path $file -Pattern 'WholeProgramOptimization|LinkTimeCodeGeneration' |
+            ForEach-Object { Write-Host $_.Line }
+
+      - name: Rebuild optimized native deviceid addon
+        shell: pwsh
+        run: |
+          Remove-Item Env:LINK -ErrorAction SilentlyContinue
+          Remove-Item Env:_LINK_ -ErrorAction SilentlyContinue
+          Remove-Item Env:_CL_ -ErrorAction SilentlyContinue
+          npm rebuild '@vscode/deviceid' --build-from-source
+          if ($LASTEXITCODE -ne 0) { throw 'deviceid native rebuild failed' }
+
+          $projectDir = 'node_modules/@vscode/deviceid/build'
+          $projects = @(Get-ChildItem -Path $projectDir -Recurse -Filter '*.vcxproj' -File -ErrorAction SilentlyContinue)
+          if ($projects.Count -eq 0) { throw 'node-gyp MSBuild project not found; cannot confirm targeted LTO.' }
+          $projectText = ($projects | ForEach-Object { Get-Content -Path $_.FullName -Raw }) -join "`n"
+          if ($projectText -notmatch 'WholeProgramOptimization') { throw 'Generated MSBuild project does not contain whole-program optimization.' }
+          if ($projectText -notmatch 'LinkTimeCodeGeneration') { throw 'Generated MSBuild project does not contain link-time code generation.' }
+          Write-Host 'Verified /GL and /LTCG settings in generated MSBuild project.'
+
+      # Preserve the workaround from the previously successful OSS workflow.
+      - name: Allow missing Copilot SDK in OSS packaging
+        shell: pwsh
+        run: |
+          $file = 'build/gulpfile.vscode.ts'
+          $source = [System.IO.File]::ReadAllText((Resolve-Path $file))
+          $old = 'prepareBuiltInCopilotRipgrepShim(platform, arch, builtInCopilotExtensionDir, appNodeModulesDir);'
+          if (-not $source.Contains($old)) {
+            throw "Expected Copilot shim call not found in $file; upstream may have changed."
+          }
+          $new = @'
+          if (fs.existsSync(path.join(builtInCopilotExtensionDir, 'node_modules', '@github', 'copilot', 'sdk'))) {
+              prepareBuiltInCopilotRipgrepShim(platform, arch, builtInCopilotExtensionDir, appNodeModulesDir);
+          } else if (process.env['VSCODE_QUALITY'] === 'oss') {
+              console.log('[Code OSS] Copilot SDK absent; skipping built-in Copilot ripgrep shim.');
+          } else {
+              throw new Error('Built-in Copilot SDK missing from non-OSS build');
+          }
+          '@
+          $source = $source.Replace($old, $new)
+          [System.IO.File]::WriteAllText((Resolve-Path $file), $source, [System.Text.UTF8Encoding]::new($false))
+
+      # Keep the SignTool lookup required by the original packaging step.
+      - name: Locate Windows SDK SignTool
+        shell: pwsh
+        run: |
+          $sdkRoots = @(
+            "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
+            "${env:ProgramFiles}\Windows Kits\10\bin"
+          )
+          $tools = foreach ($root in $sdkRoots) {
+            if (Test-Path $root) {
+              Get-ChildItem -Path $root -Filter signtool.exe -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.DirectoryName -match '[\\/]x64$' }
+            }
+          }
+          $tool = $tools | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $tool) {
+            throw 'signtool.exe not found. Install the Windows 10/11 SDK Signing Tools on this runner.'
+          }
+          Write-Host "Using SignTool: $($tool.FullName)"
+          $tool.DirectoryName >> $env:GITHUB_PATH
+          & $tool.FullName /?
+
+      # Includes the same production minification as the working original.
+      - name: Build and package optimized Code OSS
+        shell: pwsh
+        run: |
+          Remove-Item Env:LINK -ErrorAction SilentlyContinue
+          Remove-Item Env:_LINK_ -ErrorAction SilentlyContinue
+          Remove-Item Env:_CL_ -ErrorAction SilentlyContinue
+          npm run gulp -- vscode-win32-x64-min
+          if ($LASTEXITCODE -ne 0) { throw 'Code OSS packaging failed' }
+
+      - name: Locate packaged application
+        id: package
+        shell: pwsh
+        run: |
+          $candidates = @(
+            (Join-Path $env:GITHUB_WORKSPACE '..\VSCode-win32-x64'),
+            (Join-Path $env:GITHUB_WORKSPACE '.build\win32-x64'),
+            (Join-Path $env:GITHUB_WORKSPACE '.build\win32-x64\archive')
+          )
+          $package = $candidates | Where-Object {
+            (Test-Path $_ -PathType Container) -and
+            (Get-ChildItem $_ -Filter 'Code - OSS.exe' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1)
+          } | Select-Object -First 1
+          if (-not $package) {
+            throw 'Cannot find packaged Code - OSS.exe. Check the gulp build output and adjust the artifact path.'
+          }
+          $package = (Resolve-Path $package).Path
+          "path=$package" >> $env:GITHUB_OUTPUT
+          Write-Host "Packaged application: $package"
+
+      - name: Upload optimized Windows x64 application
+        uses: actions/upload-artifact@v4
+        with:
+          name: Code-OSS-Windows-x64-AVX2-Selective-GL-LTCG
+          path: ${{ steps.package.outputs.path }}/
+          if-no-files-found: error
+          retention-days: 14
