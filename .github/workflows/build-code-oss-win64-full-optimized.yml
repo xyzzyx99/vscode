@@ -97,8 +97,10 @@ jobs:
 
           $source = ([regex]::new($compilerPattern)).Replace(
             $source, '"VCCLCompilerTool": { "WholeProgramOptimization": "true", ', 1)
+          # GYP's VCLinkerTool expects the legacy numeric enum 1.
+          # GYP converts it to MSBuild's UseLinkTimeCodeGeneration.
           $source = ([regex]::new($linkerPattern)).Replace(
-            $source, '"VCLinkerTool": { "LinkTimeCodeGeneration": "UseLinkTimeCodeGeneration", "LinkIncremental": 1, ', 1)
+            $source, '"VCLinkerTool": { "LinkTimeCodeGeneration": 1, "LinkIncremental": 1, ', 1)
           [System.IO.File]::WriteAllText($file, $source, [System.Text.UTF8Encoding]::new($false))
           Write-Host "Enabled /GL + /LTCG for: $file"
           Select-String -Path $file -Pattern 'WholeProgramOptimization|LinkTimeCodeGeneration' |
@@ -110,16 +112,26 @@ jobs:
           Remove-Item Env:LINK -ErrorAction SilentlyContinue
           Remove-Item Env:_LINK_ -ErrorAction SilentlyContinue
           Remove-Item Env:_CL_ -ErrorAction SilentlyContinue
-          npm rebuild '@vscode/deviceid' --build-from-source
+          # npm rebuild runs the addon's node-gyp install hook. The deprecated
+          # --build-from-source npm CLI option is not needed here.
+          npm rebuild '@vscode/deviceid' --foreground-scripts
           if ($LASTEXITCODE -ne 0) { throw 'deviceid native rebuild failed' }
 
-          $projectDir = 'node_modules/@vscode/deviceid/build'
-          $projects = @(Get-ChildItem -Path $projectDir -Recurse -Filter '*.vcxproj' -File -ErrorAction SilentlyContinue)
-          if ($projects.Count -eq 0) { throw 'node-gyp MSBuild project not found; cannot confirm targeted LTO.' }
-          $projectText = ($projects | ForEach-Object { Get-Content -Path $_.FullName -Raw }) -join "`n"
-          if ($projectText -notmatch 'WholeProgramOptimization') { throw 'Generated MSBuild project does not contain whole-program optimization.' }
-          if ($projectText -notmatch 'LinkTimeCodeGeneration') { throw 'Generated MSBuild project does not contain link-time code generation.' }
-          Write-Host 'Verified /GL and /LTCG settings in generated MSBuild project.'
+          $projectFile = 'node_modules/@vscode/deviceid/build/windows.vcxproj'
+          if (-not (Test-Path $projectFile -PathType Leaf)) {
+            throw "node-gyp MSBuild project not found: $projectFile"
+          }
+          $projectText = Get-Content -Path $projectFile -Raw
+          if ($projectText -notmatch '<WholeProgramOptimization>\s*true\s*</WholeProgramOptimization>') {
+            throw 'Generated Windows addon project does not enable /GL.'
+          }
+          if ($projectText -notmatch '<LinkTimeCodeGeneration>\s*UseLinkTimeCodeGeneration\s*</LinkTimeCodeGeneration>') {
+            Write-Host 'Generated link settings:'
+            Select-String -Path $projectFile -Pattern 'LinkTimeCodeGeneration|WholeProgramOptimization|LinkIncremental' |
+              ForEach-Object { Write-Host $_.Line }
+            throw 'Generated Windows addon project does not enable /LTCG.'
+          }
+          Write-Host 'Verified /GL and /LTCG settings in generated Windows addon MSBuild project.'
 
       # Preserve the workaround from the previously successful OSS workflow.
       - name: Allow missing Copilot SDK in OSS packaging
